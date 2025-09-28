@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>Edison CPD Chatbot</title>
+  <style>
+    body{font-family:Candara;background:#fff;margin:0;display:flex;flex-direction:column;height:100vh}
+    header{padding:10px;background:#f05a23;color:#fff;text-align:center;font-weight:bold}
+    #chat{flex:1;overflow:auto;padding:10px;position:relative}
+    #chat::before{
+      content:"";position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+      background:url('/avatars/logo-edison.png') no-repeat center center;
+      background-size:50% auto;opacity:.5;width:100%;height:100%;pointer-events:none
+    }
+    .row{display:flex;margin:8px 0}
+    .row.user{justify-content:flex-end}
+    .bubble{padding:10px;border-radius:10px;max-width:70%;white-space:pre-wrap}
+    .row.user .bubble{background:#ffe5d5}
+    .row.bot .bubble{background:#f1f1f1}
+    .avatar{width:32px;height:32px;border-radius:50%;margin:0 6px}
+    footer{display:flex;padding:10px;border-top:1px solid #ddd}
+    footer input{flex:1;padding:10px;border:1px solid #ccc;border-radius:5px}
+    footer button{padding:10px;background:#f05a23;color:#fff;border:none;border-radius:5px;cursor:pointer}
+    .privacy{font-size:12px;color:#666;text-align:center;padding:5px;display:none}
+    .hint{font-size:13px;padding:8px;color:#444}
+  </style>
+</head>
+<body>
+  <header>Edison CPD Chatbot</header>
+  <div id="chat"></div>
+  <div class="privacy" id="privacy">Your chat may be saved to a private log for quality and troubleshooting.</div>
+  <footer>
+    <input id="inp" placeholder="Type your message..."/>
+    <button id="btn">Send</button>
+    <button id="reset">Start new session</button>
+  </footer>
+<script>
+const ENDPOINT="/.netlify/functions/assist1";
+const $chat=document.getElementById('chat');
+const $inp=document.getElementById('inp');
+const $btn=document.getElementById('btn');
+const $reset=document.getElementById('reset');
+const $privacy=document.getElementById('privacy');
+
+function addBubble(role,text){
+  const row=document.createElement('div');row.className="row "+role;
+  const avatar=document.createElement('img');avatar.className="avatar";avatar.src=role==="user"?"/avatars/user.png":"/avatars/bot.png";
+  const bubble=document.createElement('div');bubble.className="bubble";bubble.textContent=text;
+  if(role==="user"){row.appendChild(bubble);row.appendChild(avatar);}
+  else{row.appendChild(avatar);row.appendChild(bubble);}
+  $chat.appendChild(row);$chat.scrollTop=$chat.scrollHeight;
+  return bubble;
+}
+
+function getEmail(){
+  let e=document.cookie.split('; ').find(r=>r.startsWith('edison_email='));
+  return e?decodeURIComponent(e.split('=')[1]):null;
+}
+function setEmail(email){
+  document.cookie="edison_email="+encodeURIComponent(email)+"; max-age="+60*60*24*90+"; path=/";
+}
+
+function getSession(){
+  if(!sessionStorage.session_id) sessionStorage.session_id="s_"+Date.now()+"_"+Math.random().toString(36).slice(2);
+  return sessionStorage.session_id;
+}
+
+function getThread(){
+  return localStorage.getItem("thread_id")||"";
+}
+function setThread(id){
+  localStorage.setItem("thread_id",id);
+}
+
+async function send(){
+  const email=getEmail();
+  if(!email){
+    const input=prompt("What is your email in Edison Schools?");
+    if(!input||!/@edisonschools\.edu\.vn$/i.test(input)){alert("Email must be @edisonschools.edu.vn");return;}
+    setEmail(input);
+  }
+  const msg=$inp.value.trim();if(!msg)return;$inp.value="";$inp.focus();
+  addBubble("user",msg);
+  const thinking=addBubble("bot","...");
+  $btn.disabled=true;
+  try{
+    const res=await fetch(ENDPOINT,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({
+      message:msg,email:getEmail(),session:getSession(),threadId:getThread()
+    })});
+if (!res.ok) {
+  const txt = await res.text();            // đọc text để khỏi lỗi json()
+  thinking.textContent = `⚠️ Server ${res.status}: ${txt || 'No body'}`;
+  $btn.disabled = false;
+  return;
+}
+    const data=await res.json();
+    thinking.textContent=data.reply.split("\n").map(l=>"👉 "+l).join("\n");
+    if(data.threadId) setThread(data.threadId);
+  }catch(e){thinking.textContent="⚠️ "+e.message;}
+  $btn.disabled=false;
+}
+
+$btn.onclick=send;
+$inp.onkeydown=e=>{if(e.key==="Enter")send();}
+$reset.onclick=()=>{document.cookie="edison_email=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/";localStorage.removeItem("thread_id");sessionStorage.clear();location.reload();}
+
+// Show privacy line once
+if(!localStorage.getItem("privacyShown")){$privacy.style.display="block";localStorage.setItem("privacyShown","1");}
+</script>
+</body>
+</html>
