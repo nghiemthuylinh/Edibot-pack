@@ -1,0 +1,9 @@
+[build]
+command = "npm install"
+publish = "."
+
+[functions]
+directory = "netlify/functions"
+
+[context.production.environment]
+NODE_VERSION = "18"
