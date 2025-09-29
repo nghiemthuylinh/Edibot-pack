@@ -1,7 +1,7 @@
 // /netlify/functions/assist1.js
 import OpenAI from "openai";
 
-// ===== Helpers =====
+// ==== Helpers ====================================================
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function corsHeaders(event) {
@@ -9,7 +9,7 @@ function corsHeaders(event) {
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
-  const origin = (event.headers?.origin) || "";
+  const origin = event.headers?.origin || "";
   const allowed = list.includes(origin) ? origin : (list[0] || "*");
   return {
     "Access-Control-Allow-Origin": allowed,
@@ -24,15 +24,8 @@ function isEdisonEmail(email) {
   return /@edisonschools\.edu\.vn$/i.test(email || "");
 }
 
-function vnDateTimeParts(d = new Date()) {
-  const tz = "Asia/Ho_Chi_Minh";
-  const date = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).format(d); // YYYY-MM-DD
-  const time = new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(d); // HH:mm:ss
-  return { date, time };
-}
-
-// ===== Handler (Lambda-style) =====
-export const handler = async (event, context) => {
+// ==== Netlify Lambda-style handler ===============================
+export const handler = async (event) => {
   const headers = corsHeaders(event);
 
   // Preflight
@@ -44,14 +37,61 @@ export const handler = async (event, context) => {
   }
 
   // Parse body
-  let body;
-  try {
-    body = JSON.parse(event.body || "{}");
-  } catch {
-    return { statusCode: 400, headers, body: JSON.stringify({ error: "Bad JSON" }) };
+  let body = {};
+  try { body = JSON.parse(event.body || "{}"); }
+  catch { return { statusCode: 400, headers, body: JSON.stringify({ error: "Bad JSON" }) }; }
+
+  const {
+    action,           // 'ask' | 'poll' | undefined
+    message,
+    email,
+    session,
+    threadId,
+    runId
+  } = body;
+
+  // Poll mode: chỉ kiểm run, không thêm message → rất nhanh
+  if (action === "poll") {
+    if (!threadId || !runId) {
+      return { statusCode: 400, headers, body: JSON.stringify({ error: "Missing threadId or runId" }) };
+    }
+    try {
+      const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+      const r = await client.beta.threads.runs.retrieve(
+        threadId,
+        runId,
+        { headers: { "OpenAI-Beta": "assistants=v2" } }
+      );
+
+      if (r.status === "completed") {
+        const msgs = await client.beta.threads.messages.list(
+          threadId,
+          { headers: { "OpenAI-Beta": "assistants=v2" } }
+        );
+        const last = msgs.data.find(m => m.role === "assistant");
+        const reply = (last?.content || [])
+          .map(p => p.text?.value ?? "")
+          .join("\n")
+          .trim() || "No response.";
+        return {
+          statusCode: 200,
+          headers,
+          body: JSON.stringify({ done: true, reply })
+        };
+      }
+
+      if (["failed","cancelled","expired"].includes(r.status)) {
+        return { statusCode: 200, headers, body: JSON.stringify({ done: true, reply: `Run status: ${r.status}` }) };
+      }
+
+      // vẫn đang chạy
+      return { statusCode: 202, headers, body: JSON.stringify({ pending: true }) };
+    } catch (e) {
+      return { statusCode: 500, headers, body: JSON.stringify({ error: e?.message || "Poll error" }) };
+    }
   }
 
-  const { message, threadId, session, email } = body || {};
+  // Ask mode: thêm message & tạo run; poll tối đa ~9s
   if (!message || typeof message !== "string") {
     return { statusCode: 400, headers, body: JSON.stringify({ error: "Missing field: message" }) };
   }
@@ -66,7 +106,7 @@ export const handler = async (event, context) => {
   const assistantId = process.env.ASSISTANT_ID;
 
   try {
-    // Create thread if needed, then add user message
+    // Tạo thread nếu chưa có
     let realThreadId = threadId;
     if (!realThreadId) {
       const t = await client.beta.threads.create(
@@ -76,22 +116,23 @@ export const handler = async (event, context) => {
       realThreadId = t.id;
     }
 
+    // Thêm message user
     await client.beta.threads.messages.create(
       realThreadId,
       { role: "user", content: message },
       { headers: { "OpenAI-Beta": "assistants=v2" } }
     );
 
-    // Run assistant
+    // Tạo run
     const run = await client.beta.threads.runs.create(
       realThreadId,
       { assistant_id: assistantId },
       { headers: { "OpenAI-Beta": "assistants=v2" } }
     );
 
-    // Poll for result
+    // Poll nhanh (<= ~9s)
     let replyText = "";
-    for (let i = 0; i < 40; i++) { // ~20s
+    for (let i = 0; i < 18; i++) { // 18 * 500ms ≈ 9s
       const r = await client.beta.threads.runs.retrieve(
         realThreadId,
         run.id,
@@ -103,59 +144,45 @@ export const handler = async (event, context) => {
           { headers: { "OpenAI-Beta": "assistants=v2" } }
         );
         const last = msgs.data.find(m => m.role === "assistant");
-        if (last && Array.isArray(last.content)) {
-          replyText = last.content.map(p => (p.text?.value ?? "")).join("\n").trim();
-        }
+        replyText = (last?.content || [])
+          .map(p => p.text?.value ?? "")
+          .join("\n")
+          .trim();
         break;
       }
-      if (["failed", "cancelled", "expired"].includes(r.status)) {
+      if (["failed","cancelled","expired"].includes(r.status)) {
         replyText = `Run status: ${r.status}`;
         break;
       }
       await sleep(500);
     }
-    if (!replyText) replyText = "No response received. Please try again.";
 
-    // Fire-and-forget: log to Apps Script
-    try {
-      if (process.env.LOG_WEBHOOK_URL) {
-        const { date, time } = vnDateTimeParts();
-        const payload = {
-          date,
-          time,
-          email,
-          session: session || "",
-          assistantId,
+    if (replyText) {
+      // Có kết quả trong 9s → trả ngay 200
+      return {
+        statusCode: 200,
+        headers,
+        body: JSON.stringify({
+          reply: replyText,
           threadId: realThreadId,
-          runId: run.id,
-          user: message,
-          assistant: replyText
-        };
-        await fetch(process.env.LOG_WEBHOOK_URL, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "X-Log-Token": process.env.LOG_TOKEN || ""
-          },
-          body: JSON.stringify(payload)
-        });
-      }
-    } catch (e) {
-      console.error("LOG error:", e?.message || e);
+          runId: run.id
+        })
+      };
     }
 
+    // Chưa xong → trả 202 để frontend tự poll
     return {
-      statusCode: 200,
+      statusCode: 202,
       headers,
-      body: JSON.stringify({ reply: replyText, threadId: realThreadId })
+      body: JSON.stringify({
+        pending: true,
+        threadId: realThreadId,
+        runId: run.id
+      })
     };
 
   } catch (err) {
-    console.error("Function error:", err?.response?.data || err?.message || err);
-    return {
-      statusCode: 500,
-      headers,
-      body: JSON.stringify({ error: err?.message || "Internal Server Error" })
-    };
+    console.error("assist1 error:", err?.response?.data || err?.message || err);
+    return { statusCode: 500, headers, body: JSON.stringify({ error: err?.message || "Internal Server Error" }) };
   }
 };

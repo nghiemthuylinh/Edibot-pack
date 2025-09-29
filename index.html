@@ -1,8 +1,9 @@
 <!doctype html>
-<html lang="en">
+<html lang="vi">
 <head>
   <meta charset="utf-8"/>
   <title>Edison CPD Chatbot</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <style>
     body{font-family:Candara;background:#fff;margin:0;display:flex;flex-direction:column;height:100vh}
     header{padding:10px;background:#f05a23;color:#fff;text-align:center;font-weight:bold}
@@ -12,17 +13,19 @@
       background:url('/avatars/logo-edison.png') no-repeat center center;
       background-size:50% auto;opacity:.5;width:100%;height:100%;pointer-events:none
     }
-    .row{display:flex;margin:8px 0}
+    .row{display:flex;margin:8px 0;animation:fade .25s ease-out}
+    @keyframes fade{from{opacity:.2;transform:translateY(4px)}to{opacity:1;transform:none}}
     .row.user{justify-content:flex-end}
     .bubble{padding:10px;border-radius:10px;max-width:70%;white-space:pre-wrap}
     .row.user .bubble{background:#ffe5d5}
     .row.bot .bubble{background:#f1f1f1}
     .avatar{width:32px;height:32px;border-radius:50%;margin:0 6px}
-    footer{display:flex;padding:10px;border-top:1px solid #ddd}
+    footer{display:flex;padding:10px;border-top:1px solid #ddd;gap:8px}
     footer input{flex:1;padding:10px;border:1px solid #ccc;border-radius:5px}
-    footer button{padding:10px;background:#f05a23;color:#fff;border:none;border-radius:5px;cursor:pointer}
+    footer button{padding:10px 12px;background:#f05a23;color:#fff;border:none;border-radius:5px;cursor:pointer}
     .privacy{font-size:12px;color:#666;text-align:center;padding:5px;display:none}
     .hint{font-size:13px;padding:8px;color:#444}
+    .muted{opacity:.75}
   </style>
 </head>
 <body>
@@ -34,18 +37,22 @@
     <button id="btn">Send</button>
     <button id="reset">Start new session</button>
   </footer>
+
 <script>
-const ENDPOINT="/.netlify/functions/assist1";
+const ENDPOINT = "/.netlify/functions/assist1";
+const LOG_ENDPOINT = "/.netlify/functions/drive-log";
+const ASSISTANT_ID = "asst_dI6JMhNkMf1lWs1ndxkj6eGA";
+
 const $chat=document.getElementById('chat');
 const $inp=document.getElementById('inp');
 const $btn=document.getElementById('btn');
 const $reset=document.getElementById('reset');
 const $privacy=document.getElementById('privacy');
 
-function addBubble(role,text){
+function addBubble(role,text,extraClass=""){
   const row=document.createElement('div');row.className="row "+role;
   const avatar=document.createElement('img');avatar.className="avatar";avatar.src=role==="user"?"/avatars/user.png":"/avatars/bot.png";
-  const bubble=document.createElement('div');bubble.className="bubble";bubble.textContent=text;
+  const bubble=document.createElement('div');bubble.className="bubble "+extraClass;bubble.textContent=text;
   if(role==="user"){row.appendChild(bubble);row.appendChild(avatar);}
   else{row.appendChild(avatar);row.appendChild(bubble);}
   $chat.appendChild(row);$chat.scrollTop=$chat.scrollHeight;
@@ -53,50 +60,103 @@ function addBubble(role,text){
 }
 
 function getEmail(){
-  let e=document.cookie.split('; ').find(r=>r.startsWith('edison_email='));
-  return e?decodeURIComponent(e.split('=')[1]):null;
+  const m=document.cookie.split('; ').find(r=>r.startsWith('edison_email='));
+  return m?decodeURIComponent(m.split('=')[1]):null;
 }
 function setEmail(email){
   document.cookie="edison_email="+encodeURIComponent(email)+"; max-age="+60*60*24*90+"; path=/";
 }
-
 function getSession(){
   if(!sessionStorage.session_id) sessionStorage.session_id="s_"+Date.now()+"_"+Math.random().toString(36).slice(2);
   return sessionStorage.session_id;
 }
+function getThread(){return localStorage.getItem("thread_id")||"";}
+function setThread(id){localStorage.setItem("thread_id",id);}
 
-function getThread(){
-  return localStorage.getItem("thread_id")||"";
+async function callAssist(payload){
+  const res = await fetch(ENDPOINT, { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(payload) });
+  const text = await res.text();
+  let data = {};
+  try{ data = text? JSON.parse(text) : {}; }catch{ data = { error: "Bad JSON", raw:text }; }
+  return { status: res.status, ok: res.ok, data, text };
 }
-function setThread(id){
-  localStorage.setItem("thread_id",id);
+
+async function pollUntilDone(threadId, runId, thinkingBubble){
+  for (let i=0;i<40;i++){ // ~40s
+    const r = await callAssist({ action:"poll", threadId, runId });
+    if (r.status === 200 && r.data && r.data.done) {
+      return r.data.reply || "No response.";
+    }
+    if (r.status !== 202) break;
+    thinkingBubble.textContent = "Đang xử lý…";
+    await new Promise(res=>setTimeout(res, 1000));
+  }
+  return "Hệ thống đang bận. Vui lòng thử lại.";
+}
+
+function fmtReply(text){
+  return text.split("\n").map(l=>"👉 "+l).join("\n");
 }
 
 async function send(){
-  const email=getEmail();
+  let email=getEmail();
   if(!email){
     const input=prompt("What is your email in Edison Schools?");
     if(!input||!/@edisonschools\.edu\.vn$/i.test(input)){alert("Email must be @edisonschools.edu.vn");return;}
-    setEmail(input);
+    setEmail(input); email=input;
   }
-  const msg=$inp.value.trim();if(!msg)return;$inp.value="";$inp.focus();
-  addBubble("user",msg);
-  const thinking=addBubble("bot","...");
+  const msg=$inp.value.trim(); if(!msg) return; $inp.value=""; $inp.focus();
+
+  addBubble("user", msg);
+  const thinking=addBubble("bot","...", "muted");
   $btn.disabled=true;
+
   try{
-    const res=await fetch(ENDPOINT,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({
-      message:msg,email:getEmail(),session:getSession(),threadId:getThread()
-    })});
-if (!res.ok) {
-  const txt = await res.text();            // đọc text để khỏi lỗi json()
-  thinking.textContent = `⚠️ Server ${res.status}: ${txt || 'No body'}`;
-  $btn.disabled = false;
-  return;
-}
-    const data=await res.json();
-    thinking.textContent=data.reply.split("\n").map(l=>"👉 "+l).join("\n");
-    if(data.threadId) setThread(data.threadId);
-  }catch(e){thinking.textContent="⚠️ "+e.message;}
+    // Nhịp 1: hỏi
+    const ask = await callAssist({ message: msg, email, session: getSession(), threadId: getThread() });
+
+    // Lỗi server → hiển thị text thô
+    if (!ask.ok && ask.status !== 202) {
+      thinking.textContent = `⚠️ Server ${ask.status}: ${ask.text || 'No body'}`;
+      $btn.disabled=false; return;
+    }
+
+    let reply = "";
+    let realThreadId = ask.data?.threadId || getThread();
+    if (ask.status === 200 && ask.data?.reply) {
+      reply = ask.data.reply;
+      if (ask.data.threadId) setThread(ask.data.threadId);
+    } else {
+      // 202 → poll
+      realThreadId = ask.data?.threadId || realThreadId;
+      if (realThreadId) setThread(realThreadId);
+      const runId = ask.data?.runId;
+      reply = await pollUntilDone(realThreadId, runId, thinking);
+    }
+
+    // Hiển thị kết quả
+    thinking.classList.remove("muted");
+    thinking.textContent = fmtReply(reply);
+
+    // Ghi log (best-effort, không chặn UI)
+    try {
+      await fetch(LOG_ENDPOINT, {
+        method:"POST",
+        headers:{ "Content-Type":"application/json" },
+        body: JSON.stringify({
+          session: getSession(),
+          assistantId: ASSISTANT_ID,
+          threadId: getThread(),
+          runId: ask.data?.runId || "",
+          user: msg,
+          assistant: reply
+        })
+      });
+    } catch(e){ /* im lặng */ }
+
+  } catch(e){
+    thinking.textContent = "⚠️ " + e.message;
+  }
   $btn.disabled=false;
 }
 
@@ -104,7 +164,10 @@ $btn.onclick=send;
 $inp.onkeydown=e=>{if(e.key==="Enter")send();}
 $reset.onclick=()=>{document.cookie="edison_email=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/";localStorage.removeItem("thread_id");sessionStorage.clear();location.reload();}
 
-// Show privacy line once
+// Câu chào tĩnh khi mở trang
+addBubble("bot", "Xin chào! Mình có thể giúp gì cho bạn hôm nay liên quan đến CPD không?");
+
+// Privacy line: hiện 1 lần
 if(!localStorage.getItem("privacyShown")){$privacy.style.display="block";localStorage.setItem("privacyShown","1");}
 </script>
 </body>
