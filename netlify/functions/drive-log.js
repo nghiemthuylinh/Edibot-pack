@@ -1,36 +1,60 @@
-// netlify/functions/drive-log.js
-const FETCH_TIMEOUT_MS = 8000;
-const withTimeout = (p, ms) => new Promise(res => {
-  const id = setTimeout(() => res({ ok:false, text:'TIMEOUT' }), ms);
-  p.then(res).catch(e => res({ ok:false, text:'ERR:'+String(e) })).finally(()=>clearTimeout(id));
-});
+// netlify/functions/drive-log.js  (CommonJS – chuẩn Netlify)
+const ALLOW_ORIGIN = process.env.ALLOW_ORIGIN || "";
 
-export async function handler(event) {
+function corsHeaders(event) {
+  const allow = ALLOW_ORIGIN.split(",").map(s => s.trim()).filter(Boolean);
+  const origin = (event.headers && event.headers.origin) || "";
+  const allowed = allow.includes(origin) ? origin : (allow[0] || "*");
+  return {
+    "Access-Control-Allow-Origin": allowed,
+    "Access-Control-Allow-Headers": "content-type,x-log-token",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Vary": "Origin",
+    "Content-Type": "application/json; charset=utf-8",
+  };
+}
+
+exports.handler = async (event) => {
+  const headers = corsHeaders(event);
+
+  // Preflight
+  if (event.httpMethod === "OPTIONS") {
+    return { statusCode: 204, headers, body: "" };
+  }
+  if (event.httpMethod !== "POST") {
+    return { statusCode: 405, headers, body: JSON.stringify({ error: "Method Not Allowed" }) };
+  }
+
   try {
-    const WEBHOOK = process.env.LOG_WEBHOOK_URL;  // chỉ dùng biến này
-    const TOKEN   = process.env.LOG_TOKEN;        // token cho Apps Script
+    const WEBHOOK = process.env.LOG_WEBHOOK_URL;
+    const TOKEN   = process.env.LOG_TOKEN;
 
-    if (!WEBHOOK || !TOKEN) return { statusCode:200, body:'SKIP_LOG: missing env' };
+    if (!WEBHOOK || !TOKEN) {
+      return { statusCode: 200, headers, body: JSON.stringify({ note: "SKIP_LOG: missing env" }) };
+    }
 
-    let payload = {};
-    if (event.body) { try { payload = JSON.parse(event.body); } catch { payload = { raw:event.body }; } }
-    if (!event.body || !String(event.body).trim()) return { statusCode:200, body:'SKIP_LOG: empty body' };
+    // Frontend đã gửi đúng JSON theo schema 9 trường → chuyển nguyên vẹn sang Apps Script
+    const resp = await fetch(WEBHOOK, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Log-Token": TOKEN
+      },
+      body: event.body || "{}"
+    });
 
-    const d=new Date(new Date().toLocaleString('en-US',{timeZone:'Asia/Ho_Chi_Minh'}));
-    const pad=n=>String(n).padStart(2,'0');
-    const date=`${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
-    const time=`${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-    const esc=s=>{const v=(s??'').toString().replace(/\r?\n/g,' ').trim();return /[",]/.test(v)?`"${v.replace(/"/g,'""')}"`:v;};
-    const row=[date,time,esc(payload.session||'web'),esc(payload.ip||''),esc(payload.ua||''),
-               esc(payload.assistantId||''),esc(payload.threadId||''),esc(payload.runId||''),
-               esc(payload.user||''),esc(payload.assistant||'')].join(',');
+    const text = await resp.text();
+    return {
+      statusCode: 200,
+      headers,
+      body: JSON.stringify({ ok: resp.ok, status: resp.status, text })
+    };
 
-    const isGAS = /script\.google\.com\/macros\/s\//.test(WEBHOOK);
-    const url   = isGAS ? `${WEBHOOK}?t=${encodeURIComponent(TOKEN)}` : WEBHOOK;
-    const opts  = isGAS
-      ? { method:'POST', headers:{'Content-Type':'text/plain'}, body: row }
-      : { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) };
-
-    const result = await withTimeout(fetch(url,opts).then(async r=>({ok:r.ok,text:await r.text()})), FETCH_TIMEOUT_MS);
-    return { statusCode:200, body: result.ok ? result.text : `LOG_FAIL:${result.text}` };
   } catch (e) {
+    return {
+      statusCode: 200, // không chặn UI dù log lỗi
+      headers,
+      body: JSON.stringify({ ok: false, error: String(e) })
+    };
+  }
+};
