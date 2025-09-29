@@ -38,11 +38,14 @@ export const handler = async (event) => {
 
   // Parse body
   let body = {};
-  try { body = JSON.parse(event.body || "{}"); }
-  catch { return { statusCode: 400, headers, body: JSON.stringify({ error: "Bad JSON" }) }; }
+  try {
+    body = JSON.parse(event.body || "{}");
+  } catch {
+    return { statusCode: 400, headers, body: JSON.stringify({ error: "Bad JSON" }) };
+  }
 
   const {
-    action,           // 'ask' | 'poll' | undefined
+    action,           // 'ask' | 'poll'
     message,
     email,
     session,
@@ -50,27 +53,30 @@ export const handler = async (event) => {
     runId
   } = body;
 
-  // Poll mode: chỉ kiểm run, không thêm message → rất nhanh
+  // -------------------- POLL MODE --------------------
+  // Chỉ kiểm tra tiến độ run → phản hồi cực nhanh
   if (action === "poll") {
     if (!threadId || !runId) {
       return { statusCode: 400, headers, body: JSON.stringify({ error: "Missing threadId or runId" }) };
     }
     try {
       const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
       const r = await client.beta.threads.runs.retrieve(
         threadId,
         runId,
         { headers: { "OpenAI-Beta": "assistants=v2" } }
       );
 
+      // Đã xong → lấy message cuối của assistant
       if (r.status === "completed") {
         const msgs = await client.beta.threads.messages.list(
           threadId,
           { headers: { "OpenAI-Beta": "assistants=v2" } }
         );
-        const last = msgs.data.find(m => m.role === "assistant");
+        const last = msgs.data.find((m) => m.role === "assistant");
         const reply = (last?.content || [])
-          .map(p => p.text?.value ?? "")
+          .map((p) => p.text?.value ?? "")
           .join("\n")
           .trim() || "No response.";
         return {
@@ -80,18 +86,32 @@ export const handler = async (event) => {
         };
       }
 
-      if (["failed","cancelled","expired"].includes(r.status)) {
-        return { statusCode: 200, headers, body: JSON.stringify({ done: true, reply: `Run status: ${r.status}` }) };
+      // Kết thúc bất thường
+      if (["failed", "cancelled", "expired"].includes(r.status)) {
+        return {
+          statusCode: 200,
+          headers,
+          body: JSON.stringify({ done: true, reply: `Run status: ${r.status}` })
+        };
       }
 
-      // vẫn đang chạy
-      return { statusCode: 202, headers, body: JSON.stringify({ pending: true }) };
+      // Vẫn đang chạy
+      return {
+        statusCode: 202,
+        headers,
+        body: JSON.stringify({ pending: true, status: r.status })
+      };
     } catch (e) {
-      return { statusCode: 500, headers, body: JSON.stringify({ error: e?.message || "Poll error" }) };
+      return {
+        statusCode: 500,
+        headers,
+        body: JSON.stringify({ error: e?.message || "Poll error" })
+      };
     }
   }
 
-  // Ask mode: thêm message & tạo run; poll tối đa ~9s
+  // --------------------- ASK MODE ---------------------
+  // Thêm message & tạo run → TRẢ 202 NGAY (không chờ 9s)
   if (!message || typeof message !== "string") {
     return { statusCode: 400, headers, body: JSON.stringify({ error: "Missing field: message" }) };
   }
@@ -106,7 +126,7 @@ export const handler = async (event) => {
   const assistantId = process.env.ASSISTANT_ID;
 
   try {
-    // Tạo thread nếu chưa có
+    // 1) Tạo hoặc tái sử dụng thread
     let realThreadId = threadId;
     if (!realThreadId) {
       const t = await client.beta.threads.create(
@@ -116,73 +136,40 @@ export const handler = async (event) => {
       realThreadId = t.id;
     }
 
-    // Thêm message user
+    // 2) Thêm message của user
     await client.beta.threads.messages.create(
       realThreadId,
       { role: "user", content: message },
       { headers: { "OpenAI-Beta": "assistants=v2" } }
     );
 
-    // Tạo run
+    // 3) Tạo run (không đợi hoàn tất)
     const run = await client.beta.threads.runs.create(
       realThreadId,
-      { assistant_id: assistantId },
+      {
+        assistant_id: assistantId,
+        // Có thể thêm instructions / truncation / max_output_tokens nếu muốn nhanh hơn
+      },
       { headers: { "OpenAI-Beta": "assistants=v2" } }
     );
 
-    // Poll nhanh (<= ~9s)
-    let replyText = "";
-    for (let i = 0; i < 18; i++) { // 18 * 500ms ≈ 9s
-      const r = await client.beta.threads.runs.retrieve(
-        realThreadId,
-        run.id,
-        { headers: { "OpenAI-Beta": "assistants=v2" } }
-      );
-      if (r.status === "completed") {
-        const msgs = await client.beta.threads.messages.list(
-          realThreadId,
-          { headers: { "OpenAI-Beta": "assistants=v2" } }
-        );
-        const last = msgs.data.find(m => m.role === "assistant");
-        replyText = (last?.content || [])
-          .map(p => p.text?.value ?? "")
-          .join("\n")
-          .trim();
-        break;
-      }
-      if (["failed","cancelled","expired"].includes(r.status)) {
-        replyText = `Run status: ${r.status}`;
-        break;
-      }
-      await sleep(500);
-    }
-
-    if (replyText) {
-      // Có kết quả trong 9s → trả ngay 200
-      return {
-        statusCode: 200,
-        headers,
-        body: JSON.stringify({
-          reply: replyText,
-          threadId: realThreadId,
-          runId: run.id
-        })
-      };
-    }
-
-    // Chưa xong → trả 202 để frontend tự poll
+    // 4) TRẢ 202 NGAY để client hiện “Đang đọc tài liệu…” và bắt đầu poll
     return {
       statusCode: 202,
       headers,
       body: JSON.stringify({
         pending: true,
         threadId: realThreadId,
-        runId: run.id
+        runId: run.id,
+        status: run.status || "queued"
       })
     };
-
   } catch (err) {
     console.error("assist1 error:", err?.response?.data || err?.message || err);
-    return { statusCode: 500, headers, body: JSON.stringify({ error: err?.message || "Internal Server Error" }) };
+    return {
+      statusCode: 500,
+      headers,
+      body: JSON.stringify({ error: err?.message || "Internal Server Error" })
+    };
   }
 };
