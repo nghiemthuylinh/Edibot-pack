@@ -50,36 +50,90 @@ function textResp(status, text, origin, extra = {}) {
 
 // --- Utilities ---
 function getLatestAssistantText(messagesList) {
-  // messagesList: { data: [ ... ] } (OpenAI SDK format)
   const items = messagesList?.data || [];
-  const last = items.find(m => m.role === "assistant") || items[0];
-  if (!last || !last.content) return "";
-  // Extract text
+  const lastAssistant = items.find(m => m.role === "assistant") || items[0];
+  if (!lastAssistant || !lastAssistant.content) return "";
   let acc = "";
-  for (const c of last.content) {
+  for (const c of lastAssistant.content) {
     if (c.type === "text" && c.text?.value) acc += c.text.value + "\n";
   }
   return acc.trim();
 }
 
+// NEW: helper nhận diện lỗi "active run"
+function isActiveRunError(e) {
+  const s = String(e?.message || e || "");
+  return /already has an active run/i.test(s);
+}
+
+// NEW: thêm message vào thread với retry tránh lỗi "active run"
+async function addMessageWithRetry(threadId, payload, headers, {
+  retries = 2,
+  waitMs = 800,
+  createNewThreadOnExhaust = true,
+  metaForNewThread = {}
+} = {}) {
+
+  const tryAdd = async (tid) => {
+    return client.beta.threads.messages.create(tid, payload, headers);
+  };
+
+  let tid = threadId;
+  for (let i = 0; i <= retries; i++) {
+    try {
+      await tryAdd(tid);
+      return tid; // thành công
+    } catch (err) {
+      if (!isActiveRunError(err)) throw err; // không phải lỗi active-run → ném ra luôn
+      if (i < retries) await new Promise(r => setTimeout(r, waitMs));
+      else {
+        // hết lượt retry
+        if (!createNewThreadOnExhaust) throw err;
+        // tạo thread mới để không văng 400 (chấp nhận mất ngữ cảnh)
+        const t2 = await client.beta.threads.create(
+          { metadata: metaForNewThread },
+          { headers: { "OpenAI-Beta": "assistants=v2" } }
+        );
+        tid = t2.id;
+        await tryAdd(tid); // nếu văng nữa thì ném ra
+        return tid;
+      }
+    }
+  }
+}
+
+// ĐÃ SỬA: đảm bảo thêm message an toàn khi run trước còn active
 async function ensureThreadWithMessage({ threadId, message, email, session }) {
   let tid = threadId;
   if (!tid) {
-    const t = await client.beta.threads.create({
-      metadata: { email: email || "", session: session || "" },
-    }, { headers: { "OpenAI-Beta": "assistants=v2" } });
+    const t = await client.beta.threads.create(
+      { metadata: { email: email || "", session: session || "" } },
+      { headers: { "OpenAI-Beta": "assistants=v2" } }
+    );
     tid = t.id;
   }
-  await client.beta.threads.messages.create(
+
+  const payload = {
+    role: "user",
+    content: message,
+    metadata: { email: email || "", session: session || "" },
+  };
+  const headers = { headers: { "OpenAI-Beta": "assistants=v2" } };
+
+  // Thêm message với retry: 2 lần chờ 800ms; nếu vẫn active → tạo thread mới
+  const tidFinal = await addMessageWithRetry(
     tid,
+    payload,
+    headers,
     {
-      role: "user",
-      content: message,
-      metadata: { email: email || "", session: session || "" },
-    },
-    { headers: { "OpenAI-Beta": "assistants=v2" } }
+      retries: 2,
+      waitMs: 800,
+      createNewThreadOnExhaust: true,
+      metaForNewThread: { email: email || "", session: session || "" }
+    }
   );
-  return tid;
+
+  return tidFinal;
 }
 
 async function createRun(threadId) {
@@ -108,11 +162,10 @@ async function listMessages(threadId, limit = 10) {
 async function pollForCompletion({ threadId, runId, budgetMs = POLL_BUDGET_MS }) {
   const start = Date.now();
   let sleep = 300;
-  // simple backoff up to ~1s
   while (Date.now() - start < budgetMs) {
     const run = await getRun(threadId, runId);
     const st = run.status;
-    if (st === "completed" || st === "requires_action" || st === "failed" || st === "cancelled" || st === "expired") {
+    if (["completed","requires_action","failed","cancelled","expired"].includes(st)) {
       return st;
     }
     await new Promise(r => setTimeout(r, sleep));
@@ -125,23 +178,15 @@ export async function handler(event, context) {
   const origin = pickOrigin(event.headers?.origin || event.headers?.Origin || "*");
 
   if (event.httpMethod === "OPTIONS") {
-    return {
-      statusCode: 204,
-      headers: baseHeaders(origin),
-      body: "",
-    };
+    return { statusCode: 204, headers: baseHeaders(origin), body: "" };
   }
-
   if (event.httpMethod !== "POST") {
     return textResp(405, "Method Not Allowed", origin);
   }
 
   let body = {};
-  try {
-    body = event.body ? JSON.parse(event.body) : {};
-  } catch {
-    return jsonResp(400, { error: "Bad JSON body" }, origin);
-  }
+  try { body = event.body ? JSON.parse(event.body) : {}; }
+  catch { return jsonResp(400, { error: "Bad JSON body" }, origin); }
 
   const action = body.action || ""; // "stream" | "poll" | ""
   const message = (body.message || "").toString();
@@ -154,40 +199,31 @@ export async function handler(event, context) {
     return jsonResp(500, { error: "Missing ASSISTANT_ID env" }, origin);
   }
 
-  // --- STREAM: Assistants v2 runs.stream → SSE to client ---
+  // --- STREAM: Assistants v2 runs.stream → SSE ---
   if (action === "stream") {
     if (!message && !threadId) {
       return jsonResp(400, { error: "Need message or threadId" }, origin);
     }
 
-    // Netlify Lambda (Node 18) can return a "stream" by using a special flag.
-    // We'll emulate SSE by collecting chunks as they arrive and writing via a web ReadableStream.
-    // IMPORTANT: Some hosts buffer responses; if your host buffers, the client will still fallback to poll.
     const encoder = new TextEncoder();
-
-    // Create a ReadableStream to push SSE chunks
     const stream = new ReadableStream({
       async start(controller) {
         try {
           const tid = await ensureThreadWithMessage({ threadId, message, email, session });
           threadId = tid;
-
-          // Notify client of threadId first
           controller.enqueue(encoder.encode(`event: meta\ndata: ${JSON.stringify({ threadId })}\n\n`));
 
-          const s = await client.beta.threads.runs.stream(
+          // Mở stream run
+          await client.beta.threads.runs.stream(
             tid,
             { assistant_id: ASSISTANT_ID },
             {
               headers: { "OpenAI-Beta": "assistants=v2" },
-              // Global handler to be safe:
-              onEvent: (ev) => {
-                // You can inspect all events if needed:
-                // controller.enqueue(encoder.encode(`event: evt\ndata: ${JSON.stringify(ev)}\n\n`));
+              onRunCreated: (ev) => {
+                // gửi runId sớm cho client (nếu muốn log)
+                controller.enqueue(encoder.encode(`event: meta\ndata: ${JSON.stringify({ runId: ev.id })}\n\n`));
               },
-              // Token deltas
               onMessageDelta: ({ delta }) => {
-                // Concatenate only text deltas
                 if (delta?.content) {
                   for (const c of delta.content) {
                     if (c.type === "output_text_delta" && c.text) {
@@ -196,11 +232,9 @@ export async function handler(event, context) {
                   }
                 }
               },
-              // When a message completes, we can notify end-of-message
               onMessageCompleted: () => {
                 controller.enqueue(encoder.encode(`event: message_complete\ndata: {}\n\n`));
               },
-              // When the run ends, we close SSE
               onEnd: () => {
                 controller.enqueue(encoder.encode(`event: end\ndata: {}\n\n`));
                 controller.close();
@@ -211,9 +245,6 @@ export async function handler(event, context) {
               },
             }
           );
-
-          // Safety: If SDK returns early, we ensure closure
-          // (Most of the time onEnd will close)
         } catch (e) {
           controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({ message: String(e?.message || e) })}\n\n`));
           controller.close();
@@ -221,7 +252,6 @@ export async function handler(event, context) {
       },
     });
 
-    // Return Response-like object with stream body
     return {
       statusCode: 200,
       headers: {
@@ -229,15 +259,13 @@ export async function handler(event, context) {
         "Content-Type": "text/event-stream; charset=utf-8",
         "Cache-Control": "no-cache, no-transform",
         "Connection": "keep-alive",
-        // Important for Netlify/AWS to not base64 the body
         "Transfer-Encoding": "chunked",
       },
-      // netlify shim understands this special key:
       body: stream,
     };
   }
 
-  // --- POLL: check run status & fetch reply if done (fallback) ---
+  // --- POLL (fallback) ---
   if (action === "poll") {
     if (!threadId || !runId) {
       return jsonResp(400, { error: "Need threadId and runId" }, origin);
@@ -250,7 +278,7 @@ export async function handler(event, context) {
         const reply = getLatestAssistantText(msgs);
         return jsonResp(200, { done: true, reply, threadId, runId, status: st }, origin);
       }
-      if (st === "failed" || st === "cancelled" || st === "expired") {
+      if (["failed","cancelled","expired"].includes(st)) {
         return jsonResp(200, { done: true, reply: `Run ${st}.`, threadId, runId, status: st }, origin);
       }
       return jsonResp(202, { done: false, threadId, runId, status: st }, origin);
@@ -259,7 +287,7 @@ export async function handler(event, context) {
     }
   }
 
-  // --- DEFAULT: create message → create run → poll nhanh ~9s (logic cũ) ---
+  // --- DEFAULT: tạo message → tạo run → poll nhanh ~9s (logic cũ) ---
   if (!message) {
     return jsonResp(400, { error: "Missing message" }, origin);
   }
@@ -273,7 +301,6 @@ export async function handler(event, context) {
       const reply = getLatestAssistantText(msgs);
       return jsonResp(200, { reply, threadId: tid, runId: run.id, status: st }, origin);
     }
-    // Chưa xong → để client tiếp tục poll
     return jsonResp(202, { threadId: tid, runId: run.id, status: st }, origin);
   } catch (e) {
     return jsonResp(500, { error: String(e?.message || e) }, origin);
