@@ -8,7 +8,6 @@
     body{font-family:Candara;background:#fff;margin:0;display:flex;flex-direction:column;height:100vh}
     header{padding:10px;background:#f05a23;color:#fff;text-align:center;font-weight:bold}
     #chat{flex:1;overflow:auto;padding:10px;position:relative}
-    /* Logo nền: ~80% mờ (opacity .2) */
     #chat::before{
       content:"";position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
       background:url('/avatars/logo-edison.png') no-repeat center center;
@@ -17,73 +16,47 @@
     .row{display:flex;margin:8px 0;animation:fade .25s ease-out}
     @keyframes fade{from{opacity:.2;transform:translateY(4px)}to{opacity:1;transform:none}}
     .row.user{justify-content:flex-end}
-    .bubble{padding:10px;border-radius:10px;max-width:70%;white-space:pre-wrap; line-height:1.4}
+    .bubble{padding:10px;border-radius:10px;max-width:70%;white-space:pre-wrap}
     .row.user .bubble{background:#ffe5d5}
     .row.bot .bubble{background:#f1f1f1}
     .avatar{width:32px;height:32px;border-radius:50%;margin:0 6px}
-    .muted{opacity:.75;font-style:italic}
-
-    .suggestions{display:flex;flex-wrap:wrap;gap:8px;padding:8px 10px;border-top:1px solid #eee}
-    .suggestions button{border:1px solid #ddd;background:#fff;border-radius:999px;padding:6px 10px;cursor:pointer}
-    .suggestions button:hover{border-color:#f05a23}
-
-    .privacy{font-size:12px;color:#666;text-align:center;padding:5px;display:none}
     footer{display:flex;padding:10px;border-top:1px solid #ddd;gap:8px}
     footer input{flex:1;padding:10px;border:1px solid #ccc;border-radius:5px}
     footer button{padding:10px 12px;background:#f05a23;color:#fff;border:none;border-radius:5px;cursor:pointer}
-    footer button[disabled]{opacity:.6;cursor:not-allowed}
+    .privacy{font-size:12px;color:#666;text-align:center;padding:5px;display:none}
+    .hint{font-size:13px;padding:8px;color:#444}
+    .muted{opacity:.75}
   </style>
 </head>
 <body>
   <header>Edison CPD Chatbot</header>
-
   <div id="chat"></div>
-  <div id="sugg" class="suggestions"></div>
-
   <div class="privacy" id="privacy">Your chat may be saved to a private log for quality and troubleshooting.</div>
-
   <footer>
-    <input id="inp" placeholder="Type your message..." autocomplete="off"/>
-    <button id="btn" type="button" title="Send (Enter)">Send</button>
-    <button id="reset" type="button" title="Start new session">Start new session</button>
+    <input id="inp" placeholder="Type your message..."/>
+    <button id="btn">Send</button>
+    <button id="reset">Start new session</button>
   </footer>
 
 <script>
 const ENDPOINT = "/.netlify/functions/assist1";
 const LOG_ENDPOINT = "/.netlify/functions/drive-log";
-// ASSISTANT_ID không cần ở client (server đã có), giữ lại nếu bạn dùng log
-const ASSISTANT_ID = "asst_xxxxxxxxxxxxxxxxxxxxx";
+const ASSISTANT_ID = "asst_dI6JMhNkMf1lWs1ndxkj6eGA";
 
 const $chat=document.getElementById('chat');
 const $inp=document.getElementById('inp');
 const $btn=document.getElementById('btn');
 const $reset=document.getElementById('reset');
 const $privacy=document.getElementById('privacy');
-const $sugg=document.getElementById('sugg');
-
-const SUGGESTIONS=[
-  "What is SEL?",
-  "Observation procedure?",
-  "What is Bloom's Taxonomy?",
-  "How to write backward design objectives?",
-  "What is my level in teaching English?"
-];
 
 function addBubble(role,text,extraClass=""){
   const row=document.createElement('div');row.className="row "+role;
-  const avatar=document.createElement('img');avatar.className="avatar";avatar.alt=role;avatar.src=role==="user"?"/avatars/user.png":"/avatars/bot.png";
+  const avatar=document.createElement('img');avatar.className="avatar";avatar.src=role==="user"?"/avatars/user.png":"/avatars/bot.png";
   const bubble=document.createElement('div');bubble.className="bubble "+extraClass;bubble.textContent=text;
-  if(role==="user"){row.appendChild(bubble);row.appendChild(avatar);} else {row.appendChild(avatar);row.appendChild(bubble);}
+  if(role==="user"){row.appendChild(bubble);row.appendChild(avatar);}
+  else{row.appendChild(avatar);row.appendChild(bubble);}
   $chat.appendChild(row);$chat.scrollTop=$chat.scrollHeight;
   return bubble;
-}
-function renderSuggestions(){
-  $sugg.innerHTML="";
-  SUGGESTIONS.forEach(q=>{
-    const b=document.createElement('button'); b.type="button"; b.textContent=q;
-    b.onclick=()=>{ $inp.value=q; send(); };
-    $sugg.appendChild(b);
-  });
 }
 
 function getEmail(){
@@ -100,217 +73,102 @@ function getSession(){
 function getThread(){return localStorage.getItem("thread_id")||"";}
 function setThread(id){localStorage.setItem("thread_id",id);}
 
-function fmtReply(text){
-  return (text || "")
-    .split(/\r?\n/).map(s => s.trim()).filter(Boolean)
-    .map(l => l.startsWith("👉") ? l : "👉 " + l)
-    .join("\n");
-}
-function cleanAssistant(text){
-  if (!text) return "";
-  let t = text;
-  const cutMarks = [
-    /^#+\s*references\b/i, /^#+\s*resources\b/i,
-    /^#+\s*(tài liệu|tham khảo)\b/i,
-    /^\s*(references|resources|tài liệu tham khảo|nguồn)\s*:\s*$/i
-  ];
-  const lines = t.split(/\r?\n/);
-  const idx = lines.findIndex(line => cutMarks.some(rx => rx.test(line.trim())));
-  if (idx !== -1) t = lines.slice(0, idx).join("\n");
-  t = t.replace(/\[[^\]]*source[^\]]*\]/gi, ""); // [..source..]
-  t = t.replace(/\[\s*\d+\s*\]/g, "");          // [1], [2]...
-  t = t.replace(/\n{2,}/g, "\n");
-  t = t.replace(/\b(as an ai|i'm an ai|as a language model)[^.\n]*[.\n]/gi, "");
-  return t.trim();
-}
-
-function animateThinking(bubble){
-  let dots=0;
-  bubble.textContent="Đang xử lý";
-  const t = setInterval(()=>{ dots=(dots+1)%4; bubble.textContent = "Đang xử lý" + ".".repeat(dots); },400);
-  return ()=>clearInterval(t);
-}
-
 async function callAssist(payload){
   const res = await fetch(ENDPOINT, { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(payload) });
   const text = await res.text();
   let data = {};
   try{ data = text? JSON.parse(text) : {}; }catch{ data = { error: "Bad JSON", raw:text }; }
-  return { status: res.status, ok: res.ok, data, text, headers: res.headers };
+  return { status: res.status, ok: res.ok, data, text };
 }
 
 async function pollUntilDone(threadId, runId, thinkingBubble){
-  const stop = animateThinking(thinkingBubble);
-  for (let i=0;i<60;i++){ // ~24s
+  for (let i=0;i<40;i++){ // ~40s
     const r = await callAssist({ action:"poll", threadId, runId });
-    if (r.status === 200 && r.data && r.data.done) { stop(); return r.data.reply || "No response."; }
+    if (r.status === 200 && r.data && r.data.done) {
+      return r.data.reply || "No response.";
+    }
     if (r.status !== 202) break;
-    await new Promise(res=>setTimeout(res, 400));
+    thinkingBubble.textContent = "Đang xử lý…";
+    await new Promise(res=>setTimeout(res, 1000));
   }
-  stop();
   return "Hệ thống đang bận. Vui lòng thử lại.";
 }
 
-async function streamFirstThenFallback({msg,email,thinking}){
-  // 1) thử stream qua fetch + ReadableStream
-  try{
-    const res = await fetch(ENDPOINT, {
-      method: "POST",
-      headers: { "Content-Type":"application/json" },
-      body: JSON.stringify({ action: "stream", message: msg, email, session: getSession(), threadId: getThread() })
-    });
-
-    const ct = res.headers.get("content-type") || "";
-    if (res.ok && ct.startsWith("text/event-stream") && res.body) {
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let acc = ""; // tích lũy text
-      let threadIdFromMeta = "";
-
-      const stop = animateThinking(thinking);
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const chunk = decoder.decode(value, { stream: true });
-
-        // SSE lines: either "event: ..." or "data: ...\n\n"
-        const lines = chunk.split(/\r?\n/);
-        for (const line of lines) {
-          if (!line) continue;
-          if (line.startsWith("event:")) {
-            // ignore or handle event name
-            continue;
-          }
-          if (line.startsWith("data:")) {
-            const raw = line.slice(5).trim();
-            if (!raw) continue;
-            try {
-              const obj = JSON.parse(raw);
-              if (obj.threadId) {
-                threadIdFromMeta = obj.threadId;
-                setThread(threadIdFromMeta);
-              } else if (obj.type === "delta" && typeof obj.text === "string") {
-                acc += obj.text;
-                thinking.classList.remove("muted");
-                thinking.textContent = cleanAssistant(acc);
-                $chat.scrollTop = $chat.scrollHeight;
-              }
-            } catch{ /* ignore parse errors */ }
-          }
-        }
-      }
-      stop();
-
-      // nếu acc có dữ liệu → thành công, không fallback
-      if (acc.trim()) return true;
-      // nếu không có dữ liệu, sẽ fallback
-    }
-  } catch(e){
-    // ignore → fallback
-  }
-  return false;
+function fmtReply(text){
+  return text.split("\n").map(l=>"👉 "+l).join("\n");
 }
 
-let sending = false;
 async function send(){
-  if (sending) return;
   let email=getEmail();
   if(!email){
     const input=prompt("What is your email in Edison Schools?");
     if(!input||!/@edisonschools\.edu\.vn$/i.test(input)){alert("Email must be @edisonschools.edu.vn");return;}
     setEmail(input); email=input;
   }
-  const msg=$inp.value.trim(); if(!msg) return;
-  $inp.value=""; $inp.focus();
+  const msg=$inp.value.trim(); if(!msg) return; $inp.value=""; $inp.focus();
 
   addBubble("user", msg);
   const thinking=addBubble("bot","...", "muted");
-  $btn.disabled=true; $inp.disabled=true; sending=true;
+  $btn.disabled=true;
 
   try{
-    // Try STREAM first (Assistants v2 runs.stream)
-    const streamed = await streamFirstThenFallback({ msg, email, thinking });
+    // Nhịp 1: hỏi
+    const ask = await callAssist({ message: msg, email, session: getSession(), threadId: getThread() });
 
-    if (!streamed) {
-      // Fallback: nhịp cũ (ask → 200/202 → poll)
-      const ask = await callAssist({ message: msg, email, session: getSession(), threadId: getThread() });
-
-      if (!ask.ok && ask.status !== 202) {
-        thinking.textContent = `⚠️ Server ${ask.status}: ${ask.text || 'No body'}`;
-        return;
-      }
-
-      let reply = "";
-      let realThreadId = ask.data?.threadId || getThread();
-      if (ask.status === 200 && ask.data?.reply) {
-        reply = ask.data.reply;
-        if (ask.data.threadId) setThread(ask.data.threadId);
-      } else {
-        realThreadId = ask.data?.threadId || realThreadId;
-        if (realThreadId) setThread(realThreadId);
-        const runId = ask.data?.runId;
-        reply = await pollUntilDone(realThreadId, runId, thinking);
-      }
-
-      thinking.classList.remove("muted");
-      thinking.textContent = fmtReply(cleanAssistant(reply));
+    // Lỗi server → hiển thị text thô
+    if (!ask.ok && ask.status !== 202) {
+      thinking.textContent = `⚠️ Server ${ask.status}: ${ask.text || 'No body'}`;
+      $btn.disabled=false; return;
     }
 
-    // Best-effort log (không chặn UI)
+    let reply = "";
+    let realThreadId = ask.data?.threadId || getThread();
+    if (ask.status === 200 && ask.data?.reply) {
+      reply = ask.data.reply;
+      if (ask.data.threadId) setThread(ask.data.threadId);
+    } else {
+      // 202 → poll
+      realThreadId = ask.data?.threadId || realThreadId;
+      if (realThreadId) setThread(realThreadId);
+      const runId = ask.data?.runId;
+      reply = await pollUntilDone(realThreadId, runId, thinking);
+    }
+
+    // Hiển thị kết quả
+    thinking.classList.remove("muted");
+    thinking.textContent = fmtReply(reply);
+
+    // Ghi log (best-effort, không chặn UI)
     try {
-      fetch(LOG_ENDPOINT, {
+      await fetch(LOG_ENDPOINT, {
         method:"POST",
         headers:{ "Content-Type":"application/json" },
         body: JSON.stringify({
           session: getSession(),
           assistantId: ASSISTANT_ID,
           threadId: getThread(),
-          runId: "", // có thể bổ sung ở backend nếu cần
+          runId: ask.data?.runId || "",
           user: msg,
-          assistant: document.querySelectorAll('.row.bot .bubble:last-child')[0]?.textContent || ""
+          assistant: reply
         })
-      }).catch(()=>{});
-    } catch(e){}
+      });
+    } catch(e){ /* im lặng */ }
 
   } catch(e){
-    thinking.textContent = "⚠️ " + (e && e.message ? e.message : e);
-  } finally {
-    $btn.disabled=false; $inp.disabled=false; sending=false;
+    thinking.textContent = "⚠️ " + e.message;
   }
+  $btn.disabled=false;
 }
 
-// Bind
-$btn.onclick = send;
-$inp.addEventListener('keydown', (e)=>{
-  if (e.isComposing) return; // đang gõ tiếng Việt
-  if (e.key === "Enter") { e.preventDefault(); send(); }
-});
-$reset.onclick=()=>{
-  document.cookie="edison_email=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/";
-  localStorage.removeItem("thread_id");
-  sessionStorage.clear();
-  location.reload();
-};
+$btn.onclick=send;
+$inp.onkeydown=e=>{if(e.key==="Enter")send();}
+$reset.onclick=()=>{document.cookie="edison_email=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/";localStorage.removeItem("thread_id");sessionStorage.clear();location.reload();}
 
-// Greeting + Suggestions + Privacy
+// Câu chào tĩnh khi mở trang
 addBubble("bot", "Xin chào! Mình có thể giúp gì cho bạn hôm nay liên quan đến CPD không?");
-renderSuggestions();
 
-(function ensureEmailOnLoad(){
-  if (!getEmail()) {
-    const input = prompt("What is your email in Edison Schools?");
-    if (input && /@edisonschools\.edu\.vn$/i.test(input)) {
-      setEmail(input);
-    } else {
-      alert("Email must be @edisonschools.edu.vn");
-    }
-  }
-})();
-if(!localStorage.getItem("privacyShown")){
-  $privacy.style.display="block";
-  localStorage.setItem("privacyShown","1");
-}
+// Privacy line: hiện 1 lần
+if(!localStorage.getItem("privacyShown")){$privacy.style.display="block";localStorage.setItem("privacyShown","1");}
 </script>
 </body>
 </html>
